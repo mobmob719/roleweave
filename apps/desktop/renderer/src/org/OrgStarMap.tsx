@@ -10,13 +10,15 @@
  * through CSS2DRenderer so names stay pixel-crisp at every zoom level
  * (canvas-baked sprites smear; this view forbids that).
  *
- * Interactions: left-drag orbits the camera, wheel zooms, right-drag pans;
- * clicking a body selects the position (same channel as the directory tree);
- * dragging a body onto another body proposes a reporting-line move through
- * the existing change-manifest channel, with the cycle guard refusing
- * self/descendant drops visibly. The dock offers locate-by-name/id with a
- * camera fly-to, hire-under-selection, caller-owned dismiss and undo — no new
- * mutation path is invented here.
+ * Interactions: OrbitControls defaults — left-drag orbits, wheel zooms,
+ * right-drag pans. Auto-rotate is a dedicated button. Clicking a body selects
+ * the position (same channel as the directory tree); empty canvas clicks do
+ * not close the card or toggle rotation. Labels: root/managers stay visible;
+ * others fade in on hover, selection, or close camera. Dragging a body onto
+ * another body proposes a reporting-line move through the existing
+ * change-manifest channel, with the cycle guard refusing self/descendant
+ * drops visibly. The dock is search-only; hire, dismiss, undo and camera
+ * helpers live on the person card or the one-shot help panel.
  *
  * three.js is imported by this module only; App lazy-loads it, so the default
  * renderer bundle never pays for WebGL. Environments without a WebGL context
@@ -55,6 +57,7 @@ export interface OrgStarMapProps {
   avatarUrls?: Record<string, string>;
   displayTitles?: Record<string, string>;
   displayModes?: Record<string, "read_only" | "approval_required">;
+  displayEngines?: Record<string, string>;
   /** Position ids with a turn in flight: the halo pulses AI purple. */
   runningIds?: ReadonlySet<string>;
   selectedId?: string | null;
@@ -103,6 +106,7 @@ interface SceneState {
   } | null;
   drag: { id: string; x: number; y: number; moved: boolean } | null;
   dropCandidate: string | null;
+  hoverId: string | null;
   disposed: boolean;
   sky: THREE.Group;
 }
@@ -320,6 +324,7 @@ export default function OrgStarMap({
   avatarUrls,
   displayTitles,
   displayModes,
+  displayEngines,
   runningIds,
   selectedId,
   onSelect,
@@ -339,13 +344,17 @@ export default function OrgStarMap({
   const [toast, setToast] = useState<string | null>(null);
   /** The focus card hides itself on 拉远/关闭 until the selection changes. */
   const [cardDismissed, setCardDismissed] = useState(false);
+  const [helpOpen, setHelpOpen] = useState(false);
+  const [autoRotate, setAutoRotate] = useState(false);
+  const [searchIndex, setSearchIndex] = useState(0);
   const reducedMotion =
     typeof window !== "undefined" &&
     typeof window.matchMedia === "function" &&
     window.matchMedia("(prefers-reduced-motion: reduce)").matches;
 
-  const latest = useRef({ onSelect, onMove, moveDisabled, selectedId, runningIds, query, reducedMotion, t });
-  latest.current = { onSelect, onMove, moveDisabled, selectedId, runningIds, query, reducedMotion, t };
+  const latest = useRef({ onSelect, onMove, moveDisabled, selectedId, runningIds, query, reducedMotion, t, autoRotate });
+  latest.current = { onSelect, onMove, moveDisabled, selectedId, runningIds, query, reducedMotion, t, autoRotate };
+  const paintRef = useRef<() => void>(() => {});
 
   useEffect(() => {
     if (toast === null) return;
@@ -379,6 +388,9 @@ export default function OrgStarMap({
     [layout, nameOf],
   );
   const candidates = useMemo(() => matchStarQuery(entries, query).slice(0, 8), [entries, query]);
+  useEffect(() => {
+    setSearchIndex(0);
+  }, [query]);
 
   /* ---------------------------------------------------------------- scene */
   useEffect(() => {
@@ -412,6 +424,8 @@ export default function OrgStarMap({
       controls.dampingFactor = 0.08;
       controls.minDistance = 8;
       controls.maxDistance = 320;
+      controls.autoRotate = false;
+      controls.autoRotateSpeed = 0.45;
       const glow = glowTexture();
 
       const sky = new THREE.Group();
@@ -503,6 +517,7 @@ export default function OrgStarMap({
         fly: null,
         drag: null,
         dropCandidate: null,
+        hoverId: null,
         disposed: false,
         sky,
       };
@@ -541,7 +556,14 @@ export default function OrgStarMap({
       };
       const onPointerMove = (event: PointerEvent): void => {
         const drag = state.drag;
-        if (!drag) return;
+        if (!drag) {
+          const hovered = pick(event.clientX, event.clientY);
+          if (hovered !== state.hoverId) {
+            state.hoverId = hovered;
+            paintRef.current();
+          }
+          return;
+        }
         if (!drag.moved && Math.hypot(event.clientX - drag.x, event.clientY - drag.y) < DRAG_THRESHOLD) return;
         drag.moved = true;
         const target = pick(event.clientX, event.clientY);
@@ -599,6 +621,7 @@ export default function OrgStarMap({
           state.camera.position.lerpVectors(state.fly.fromCam, state.fly.toCam, eased);
           if (progress >= 1) state.fly = null;
         }
+        state.controls.autoRotate = latest.current.autoRotate && !latest.current.reducedMotion;
         if (!latest.current.reducedMotion) {
           state.sky.children.forEach((child) => {
             const spin = child.userData.spin;
@@ -613,6 +636,7 @@ export default function OrgStarMap({
             view.haloMaterial.opacity = 0.78 + Math.sin(elapsed * 4.2) * 0.18;
           }
         }
+        paintRef.current();
         state.controls.update();
         state.composer.render();
         state.labelRenderer.render(state.scene, state.camera);
@@ -812,13 +836,29 @@ export default function OrgStarMap({
     if (!state) return;
     const { selectedId: selected, runningIds: running, query: rawQuery } = latest.current;
     const q = rawQuery.trim().toLowerCase();
+    const camera = state.camera.position;
+    const world = new THREE.Vector3();
     for (const view of state.views.values()) {
       const name = view.label.textContent ?? "";
       const haystack = `${name} ${view.body.id}`.toLowerCase();
       const dimmed = q.length > 0 && !haystack.includes(q);
       const isSelected = view.body.id === selected;
       const isRunning = running?.has(view.body.id) === true;
+      const isHover = view.body.id === state.hoverId;
+      view.mesh.getWorldPosition(world);
+      const dist = camera.distanceTo(world);
+      const fade = dist >= 88 ? 0 : dist <= 40 ? 1 : (88 - dist) / 48;
+      const keepAlways =
+        view.body.kind === "star" ||
+        view.body.depth <= 1 ||
+        view.body.childCount > 0 ||
+        isSelected ||
+        isHover ||
+        (q.length > 0 && !dimmed);
+      const keepLabel = keepAlways || fade > 0.04;
+      view.label.classList.toggle("is-hidden", !keepLabel);
       view.label.classList.toggle("is-dimmed", dimmed);
+      view.label.style.opacity = keepAlways ? "" : keepLabel ? String(fade) : "0";
       view.label.classList.toggle("is-selected", isSelected);
       view.mesh.scale.setScalar(isSelected ? 1.18 : 1);
       const transparent = true;
@@ -833,6 +873,7 @@ export default function OrgStarMap({
       }
     }
   }, []);
+  paintRef.current = applyVisualState;
 
   useEffect(() => {
     applyVisualState();
@@ -907,7 +948,47 @@ export default function OrgStarMap({
         {snapshot && !isEmpty ? (
           <span className="owb-star-map__meta">{t("star.meta", { count: snapshot.positionCount, depth: snapshot.depth })}</span>
         ) : null}
+        <span className="owb-star-map__head-actions">
+          <button
+            type="button"
+            className="owb-star-map__btn"
+            aria-pressed={autoRotate}
+            onClick={() => setAutoRotate((value) => !value)}
+          >
+            {autoRotate ? t("star.autoRotateOn") : t("star.autoRotateOff")}
+          </button>
+          <button
+            type="button"
+            className="owb-star-map__btn owb-star-map__help-btn"
+            aria-expanded={helpOpen}
+            aria-label={t("star.helpTitle")}
+            onClick={() => setHelpOpen((value) => !value)}
+          >
+            ?
+          </button>
+        </span>
       </header>
+      {helpOpen ? (
+        <div className="owb-star-map__help" role="dialog" aria-label={t("star.helpTitle")}>
+          <p>{t("star.hint")}</p>
+          <div className="owb-star-map__actions">
+            <button type="button" className="owb-star-map__btn" onClick={resetView}>
+              {t("star.resetView")}
+            </button>
+            <button type="button" className="owb-star-map__btn" onClick={flyHome}>
+              {t("star.zoomOut")}
+            </button>
+            {onUndo ? (
+              <button type="button" className="owb-star-map__btn" onClick={onUndo}>
+                {t("star.undo")}
+              </button>
+            ) : null}
+            <button type="button" className="owb-star-map__btn" onClick={() => setHelpOpen(false)}>
+              {t("star.close")}
+            </button>
+          </div>
+        </div>
+      ) : null}
       <div className="owb-star-map__dock">
         <div className="owb-star-map__search">
           <input
@@ -915,16 +996,41 @@ export default function OrgStarMap({
             value={query}
             onChange={(event) => setQuery(event.target.value)}
             onKeyDown={(event) => {
-              if (event.key === "Enter" && candidates[0]) locate(candidates[0]);
+              if (event.key === "Escape") {
+                event.preventDefault();
+                setQuery("");
+                return;
+              }
+              if (event.key === "ArrowDown" && candidates.length > 0) {
+                event.preventDefault();
+                setSearchIndex((index) => (index + 1) % candidates.length);
+                return;
+              }
+              if (event.key === "ArrowUp" && candidates.length > 0) {
+                event.preventDefault();
+                setSearchIndex((index) => (index - 1 + candidates.length) % candidates.length);
+                return;
+              }
+              if (event.key === "Enter") {
+                const id = candidates[searchIndex] ?? candidates[0];
+                if (id) locate(id);
+              }
             }}
             placeholder={t("star.search")}
             aria-label={t("star.search")}
+            aria-autocomplete="list"
           />
           {query.trim() && candidates.length > 0 ? (
             <ul className="owb-star-map__candidates" role="listbox" aria-label={t("star.search")}>
-              {candidates.map((id) => (
+              {candidates.map((id, index) => (
                 <li key={id}>
-                  <button type="button" role="option" aria-selected={selectedId === id} onClick={() => locate(id)}>
+                  <button
+                    type="button"
+                    role="option"
+                    aria-selected={index === searchIndex}
+                    className={index === searchIndex ? "is-active" : undefined}
+                    onClick={() => locate(id)}
+                  >
                     <span className="owb-star-map__candidate-name">{displayNames?.[id] ?? id}</span>
                     <span className="owb-star-map__candidate-id">{id}</span>
                   </button>
@@ -932,31 +1038,12 @@ export default function OrgStarMap({
               ))}
             </ul>
           ) : null}
-        </div>
-        <div className="owb-star-map__actions">
-          <button
-            type="button"
-            className="owb-star-map__btn"
-            disabled={!selectedId || moveDisabled || !onHireEntry}
-            title={t("star.hireUnderTitle")}
-            onClick={() => selectedId && onHireEntry?.(selectedId)}
-          >
-            {t("star.hireUnder")}
-          </button>
-          {dismissSlot}
-          {onUndo ? (
-            <button type="button" className="owb-star-map__btn" disabled={moveDisabled} onClick={onUndo}>
-              {t("star.undo")}
-            </button>
+          {query.trim() && candidates.length === 0 ? (
+            <p className="owb-star-map__search-empty" role="status">
+              {t("star.searchEmpty")}
+            </p>
           ) : null}
-          <button type="button" className="owb-star-map__btn" onClick={resetView}>
-            {t("star.resetView")}
-          </button>
-          <button type="button" className="owb-star-map__btn" onClick={flyHome}>
-            {t("star.zoomOut")}
-          </button>
         </div>
-        <p className="owb-star-map__hint">{t("star.hint")}</p>
         {toast ? (
           <p className="owb-star-map__toast" role="status">
             {toast}
@@ -992,15 +1079,30 @@ export default function OrgStarMap({
               <p>{t("star.reportTo", { name: parentBody ? nameOf(parentBody) : t("org.enterpriseRoot") })}</p>
               <p>{t("star.reports", { count: selectedBody.childCount })}</p>
               <p>{`${t("star.budget")}: ${selectedBudget ?? t("star.declaration")}`}</p>
+              <p>
+                {runningIds?.has(selectedBody.id) ? t("star.running") : t("star.idle")}
+                {displayEngines?.[selectedBody.id] ? ` · ${displayEngines[selectedBody.id]}` : ""}
+              </p>
             </>
           )}
           <footer>
+            {selectedBody.virtual ? null : (
+              <button type="button" className="owb-star-map__btn owb-star-map__btn--primary" onClick={() => onSelect?.(selectedBody.id)}>
+                {t("star.enterConversation")}
+              </button>
+            )}
             <button type="button" className="owb-star-map__btn" onClick={() => flyTo(selectedBody.id, true)}>
               {t("star.zoomIn")}
             </button>
-            <button type="button" className="owb-star-map__btn" onClick={flyHome}>
-              {t("star.zoomOut")}
+            <button
+              type="button"
+              className="owb-star-map__btn"
+              disabled={moveDisabled || !onHireEntry}
+              onClick={() => onHireEntry?.(selectedBody.id)}
+            >
+              {t("star.hireUnder")}
             </button>
+            {dismissSlot}
           </footer>
         </aside>
       ) : null}
